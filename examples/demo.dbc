@@ -1,0 +1,44 @@
+VERSION ""
+
+NS_ :
+
+BS_:
+
+BU_: ECU BODY
+
+BO_ 192 Heartbeat: 2 ECU
+ SG_ Counter : 0|16@1+ (1,0) [0|65535] "" Vector__XXX
+
+BO_ 256 EngineData: 8 ECU
+ SG_ RPM : 0|16@1+ (0.25,0) [0|16383.75] "rpm" Vector__XXX
+ SG_ CoolantTemp : 16|8@1+ (1,-40) [-40|215] "degC" Vector__XXX
+ SG_ RollingCounter : 56|4@1+ (1,0) [0|15] "" Vector__XXX
+
+BO_ 512 VehicleSpeed: 6 BODY
+ SG_ Speed : 7|16@0+ (0.01,0) [0|655.35] "km/h" Vector__XXX
+ SG_ Gear : 16|8@1+ (1,0) [0|6] "" Vector__XXX
+
+BO_ 513 MuxDemo: 4 BODY
+ SG_ Page M : 0|8@1+ (1,0) [0|3] "" Vector__XXX
+ SG_ CounterA m0 : 8|8@1+ (1,0) [0|255] "" Vector__XXX
+ SG_ CounterB m1 : 8|8@1+ (1,0) [0|255] "" Vector__XXX
+ SG_ CounterC m2 : 8|8@1+ (1,0) [0|255] "" Vector__XXX
+ SG_ CounterD m3 : 8|8@1+ (1,0) [0|255] "" Vector__XXX
+ SG_ Magic : 16|16@1+ (1,0) [0|65535] "" Vector__XXX
+
+BO_ 2024 OBD_Response: 8 ECU
+ SG_ Length : 0|8@1+ (1,0) [0|7] "" Vector__XXX
+ SG_ Mode : 8|8@1+ (1,0) [0|255] "" Vector__XXX
+ SG_ PID : 16|8@1+ (1,0) [0|255] "" Vector__XXX
+ SG_ A : 24|8@1+ (1,0) [0|255] "" Vector__XXX
+
+BO_ 2364539904 EEC1: 8 ECU
+ SG_ EngineSpeed : 24|16@1+ (0.125,0) [0|8031.875] "rpm" Vector__XXX
+
+BO_ 2566844672 CCVS: 8 BODY
+ SG_ WheelSpeed : 8|16@1+ (0.00390625,0) [0|250.996] "km/h" Vector__XXX
+
+CM_ BO_ 256 "Engine state broadcast every 10 ms";
+CM_ SG_ 256 RPM "Crankshaft speed";
+
+VAL_ 512 Gear 0 "P" 1 "R" 2 "N" 3 "D1" 4 "D2" 5 "D3" 6 "D4" ;
