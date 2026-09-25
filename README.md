@@ -9,6 +9,9 @@ A CAN bus viewer for Windows, macOS and Linux, built with Rust and egui.
 - **Transmit**: sends one-off frames, sends periodic frames, and plays back candump logs with their original timing (with speed control and looping).
 - **Bus status**: shows controller state (active / warning / passive / bus-off), TEC/REC, bus load %, frame rate, error events and overruns, and a 5-minute history.
 
+> [!WARNING]
+> This was originally generated with Claude Opus but edited/refined by me personally. This is the definition of "vibe-coded" but hey it works and did what I needed to do without costing an arm and a leg :shrug:
+
 ## Screenshots
 
 All screenshots use the built-in virtual bus with [`examples/demo.dbc`](examples/demo.dbc) loaded.
