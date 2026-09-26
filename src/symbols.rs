@@ -36,6 +36,8 @@ pub struct SignalDef {
     /// Only decoded when the message's multiplexor equals this value.
     pub mux: Option<u64>,
     pub values: HashMap<i64, String>,
+    /// Fixed-width display format, computed by [`SignalDef::finalize`].
+    pub fmt: ValueFormat,
 }
 
 impl SignalDef {
@@ -52,7 +54,13 @@ impl SignalDef {
             unit: String::new(),
             mux: None,
             values: HashMap::new(),
+            fmt: ValueFormat::default(),
         }
+    }
+
+    /// Computes the display format once all fields are known.
+    fn finalize(&mut self) {
+        self.fmt = ValueFormat::for_signal(self);
     }
 
     /// Extracts the raw (un-scaled) integer bits of this signal.
@@ -82,6 +90,7 @@ impl SignalDef {
             value: phys,
             unit: self.unit.clone(),
             text,
+            fmt: self.fmt,
         })
     }
 }
@@ -93,23 +102,186 @@ pub struct DecodedSignal {
     pub value: f64,
     pub unit: String,
     pub text: Option<String>,
+    pub fmt: ValueFormat,
 }
 
 impl DecodedSignal {
+    /// Fixed-width value (plus value-table text, if any), e.g. `  5354.00`.
     pub fn display_value(&self) -> String {
-        let num = if self.value.fract() == 0.0 && self.value.abs() < 1e15 {
-            format!("{}", self.value as i64)
+        self.fmt.value(self.value, self.text.as_deref())
+    }
+}
+
+/// Fixed-width numeric format for a signal, derived from its definition so
+/// the rendered width never changes while values change (no flicker).
+///
+/// * `decimals` comes from the factor/offset (0.25 -> 2, 0.1 -> 1, capped at 4)
+/// * `width` fits the largest physical value the signal's bits can encode
+/// * `text_width` fits the longest value-table entry (0 if there is none)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ValueFormat {
+    pub width: usize,
+    pub decimals: usize,
+    pub text_width: usize,
+}
+
+impl ValueFormat {
+    const MAX_DECIMALS: usize = 4;
+
+    pub fn for_signal(sig: &SignalDef) -> Self {
+        let text_width = sig
+            .values
+            .values()
+            .map(|t| t.chars().count())
+            .max()
+            .unwrap_or(0);
+        if sig.kind != SigKind::Int {
+            // IEEE floats: range isn't meaningful, use a generous fixed width.
+            return Self {
+                width: 14,
+                decimals: Self::MAX_DECIMALS,
+                text_width,
+            };
+        }
+        let decimals = decimals_for(sig.factor).max(decimals_for(sig.offset));
+        let bits = sig.size.clamp(1, 64) as i32;
+        let (raw_lo, raw_hi) = if sig.signed {
+            (-(2f64.powi(bits - 1)), 2f64.powi(bits - 1) - 1.0)
         } else {
-            format!("{:.4}", self.value)
-                .trim_end_matches('0')
-                .trim_end_matches('.')
-                .to_string()
+            (0.0, 2f64.powi(bits) - 1.0)
         };
-        match &self.text {
-            Some(t) => format!("{t} ({num})"),
-            None => num,
+        let a = raw_lo * sig.factor + sig.offset;
+        let b = raw_hi * sig.factor + sig.offset;
+        let neg = a.min(b) < 0.0;
+        // Width of the widest endpoint once rounded to `decimals`.
+        let widest = [a, b]
+            .iter()
+            .map(|v| format!("{:.*}", decimals, v.abs()).len())
+            .max()
+            .unwrap_or(1);
+        Self {
+            width: (widest + neg as usize).min(24),
+            decimals,
+            text_width,
         }
     }
+
+    /// Characters used by the fraction, including the '.' (0 for integers).
+    pub fn frac_width(&self) -> usize {
+        if self.decimals > 0 {
+            self.decimals + 1
+        } else {
+            0
+        }
+    }
+
+    /// Characters used by the sign and integer digits.
+    pub fn int_width(&self) -> usize {
+        self.width.saturating_sub(self.frac_width())
+    }
+
+    /// Right-aligned number, e.g. `  89.00`.
+    pub fn number(&self, v: f64) -> String {
+        format!("{:>w$.d$}", v, w = self.width, d = self.decimals)
+    }
+
+    /// Number followed by left-aligned value-table text (if the signal has one).
+    pub fn value(&self, v: f64, text: Option<&str>) -> String {
+        let n = self.number(v);
+        if self.text_width > 0 {
+            format!("{n} {:<tw$}", text.unwrap_or(""), tw = self.text_width)
+        } else {
+            n
+        }
+    }
+}
+
+/// Layout shared by several signals shown in one column: integer parts are
+/// right-aligned, decimal points line up, and value-table text gets its own
+/// column. Every rendered value has the same length, so units that follow
+/// also line up.
+///
+/// ```text
+///  1000.00       <- RPM
+///    89          <- CoolantTemp
+///     3    D1    <- Gear
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ValueColumn {
+    pub int_width: usize,
+    pub frac_width: usize,
+    pub text_width: usize,
+}
+
+impl ValueColumn {
+    /// Smallest column that fits every one of `fmts`. Because formats come
+    /// from the definitions, not the data, the result is stable over time.
+    pub fn fit(fmts: impl IntoIterator<Item = ValueFormat>) -> Self {
+        fmts.into_iter().fold(Self::default(), |c, f| Self {
+            int_width: c.int_width.max(f.int_width()),
+            frac_width: c.frac_width.max(f.frac_width()),
+            text_width: c.text_width.max(f.text_width),
+        })
+    }
+
+    /// Same layout without the value-table text column (for min/max).
+    pub fn numbers_only(self) -> Self {
+        Self {
+            text_width: 0,
+            ..self
+        }
+    }
+
+    /// Renders `v` with the signal's own number of decimals, aligned on the
+    /// decimal point within this column.
+    pub fn render(&self, fmt: &ValueFormat, v: f64, text: Option<&str>) -> String {
+        let n = format!("{:.*}", fmt.decimals, v);
+        let (int, frac) = n.split_at(n.find('.').unwrap_or(n.len()));
+        let mut out = format!(
+            "{int:>iw$}{frac:<fw$}",
+            iw = self.int_width,
+            fw = self.frac_width
+        );
+        if self.text_width > 0 {
+            out.push(' ');
+            out.push_str(&format!(
+                "{:<tw$}",
+                text.unwrap_or(""),
+                tw = self.text_width
+            ));
+        }
+        out
+    }
+}
+
+/// Smallest number of decimals (<= 4) that represents `x` exactly.
+fn decimals_for(x: f64) -> usize {
+    for d in 0..ValueFormat::MAX_DECIMALS {
+        let scaled = x * 10f64.powi(d as i32);
+        if (scaled - scaled.round()).abs() < 1e-9 * scaled.abs().max(1.0) {
+            return d;
+        }
+    }
+    ValueFormat::MAX_DECIMALS
+}
+
+/// One-line summary with fixed-width values (for dense views like the stream):
+/// `RPM  5354.00 rpm | CoolantTemp  89 degC`.
+pub fn format_compact(sigs: &[DecodedSignal]) -> String {
+    let mut out = String::new();
+    for (i, s) in sigs.iter().enumerate() {
+        if i > 0 {
+            out.push_str(" | ");
+        }
+        out.push_str(&s.name);
+        out.push(' ');
+        out.push_str(&s.display_value());
+        if !s.unit.is_empty() {
+            out.push(' ');
+            out.push_str(&s.unit);
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +294,14 @@ pub struct MessageDef {
     pub mux_names: HashMap<u64, String>,
     pub signals: Vec<SignalDef>,
     pub comment: Option<String>,
+    /// Most signals decoded at once (for multiplexed messages: across all
+    /// multiplexor values). Views reserve this many lines so the height of a
+    /// message never changes.
+    pub max_lines: usize,
+    /// Longest signal name, for aligning values into a column.
+    pub name_width: usize,
+    /// Shared value layout for all of this message's signals.
+    pub value_column: ValueColumn,
 }
 
 impl MessageDef {
@@ -139,9 +319,10 @@ impl MessageDef {
         };
         for s in &self.signals {
             if let Some(mv) = s.mux
-                && mux_val != Some(mv) {
-                    continue;
-                }
+                && mux_val != Some(mv)
+            {
+                continue;
+            }
             if let Some(d) = s.decode(data) {
                 out.push(d);
             }
@@ -149,12 +330,65 @@ impl MessageDef {
         out
     }
 
+    fn finalize(&mut self) {
+        if let Some(m) = &mut self.mux {
+            m.finalize();
+        }
+        for s in &mut self.signals {
+            s.finalize();
+        }
+        let plain = self.signals.iter().filter(|s| s.mux.is_none()).count();
+        let mut per_mux: HashMap<u64, usize> = HashMap::new();
+        for s in &self.signals {
+            if let Some(v) = s.mux {
+                *per_mux.entry(v).or_default() += 1;
+            }
+        }
+        self.max_lines =
+            self.mux.is_some() as usize + plain + per_mux.values().copied().max().unwrap_or(0);
+        self.name_width = self
+            .mux
+            .iter()
+            .chain(&self.signals)
+            .map(|s| s.name.chars().count())
+            .max()
+            .unwrap_or(0);
+        self.value_column = ValueColumn::fit(self.mux.iter().chain(&self.signals).map(|s| s.fmt));
+    }
+
+    /// Decodes `data` into exactly [`MessageDef::max_lines`] lines of
+    /// `name  value unit` (padded with blank lines). Names, decimal points,
+    /// value-table text and units each line up in their own column.
+    pub fn decode_lines(&self, data: &[u8]) -> Vec<String> {
+        let col = self.value_column;
+        let mut lines: Vec<String> = self
+            .decode(data)
+            .iter()
+            .map(|d| {
+                let mut l = format!(
+                    "{:<nw$}  {}",
+                    d.name,
+                    col.render(&d.fmt, d.value, d.text.as_deref()),
+                    nw = self.name_width
+                );
+                if !d.unit.is_empty() {
+                    l.push(' ');
+                    l.push_str(&d.unit);
+                }
+                l
+            })
+            .collect();
+        lines.resize(self.max_lines.max(lines.len()), String::new());
+        lines
+    }
+
     pub fn name_for(&self, data: &[u8]) -> &str {
         if !self.mux_names.is_empty()
             && let Some(v) = self.mux.as_ref().and_then(|m| m.raw(data))
-                && let Some(n) = self.mux_names.get(&v) {
-                    return n;
-                }
+            && let Some(n) = self.mux_names.get(&v)
+        {
+            return n;
+        }
         &self.name
     }
 }
@@ -262,6 +496,9 @@ fn parse_dbc(text: &str) -> anyhow::Result<SymbolDb> {
             mux_names: HashMap::new(),
             signals: Vec::new(),
             comment: dbc.message_comment(m.id).map(str::to_string),
+            max_lines: 0,
+            name_width: 0,
+            value_column: ValueColumn::default(),
         };
         for s in &m.signals {
             let mut sd = SignalDef::plain(
@@ -293,6 +530,7 @@ fn parse_dbc(text: &str) -> anyhow::Result<SymbolDb> {
             }
             def.signals.push(sd);
         }
+        def.finalize();
         db.messages.insert(key, def);
     }
     Ok(db)
@@ -397,9 +635,10 @@ fn apply_sym_opts(
         } else if let Some(v) = o.strip_prefix("/o:") {
             sd.offset = v.parse().unwrap_or(0.0);
         } else if let Some(v) = o.strip_prefix("/e:")
-            && let Some(e) = enums.get(v) {
-                sd.values = e.clone();
-            }
+            && let Some(e) = enums.get(v)
+        {
+            sd.values = e.clone();
+        }
     }
 }
 
@@ -455,19 +694,20 @@ fn parse_sym(text: &str) -> anyhow::Result<SymbolDb> {
                 }
             }
         } else if section == "{SIGNALS}"
-            && let Some(rest) = line.strip_prefix("Sig=") {
-                let toks = tokenize(rest);
-                if toks.len() >= 3 {
-                    sig_templates.insert(
-                        toks[0].clone(),
-                        SymSigTemplate {
-                            type_name: toks[1].clone(),
-                            size: toks[2].parse().unwrap_or(8),
-                            opts: toks[3..].to_vec(),
-                        },
-                    );
-                }
+            && let Some(rest) = line.strip_prefix("Sig=")
+        {
+            let toks = tokenize(rest);
+            if toks.len() >= 3 {
+                sig_templates.insert(
+                    toks[0].clone(),
+                    SymSigTemplate {
+                        type_name: toks[1].clone(),
+                        size: toks[2].parse().unwrap_or(8),
+                        opts: toks[3..].to_vec(),
+                    },
+                );
             }
+        }
     }
 
     // Second pass: message blocks.
@@ -593,6 +833,9 @@ fn parse_sym(text: &str) -> anyhow::Result<SymbolDb> {
             mux_names: HashMap::new(),
             signals: Vec::new(),
             comment: None,
+            max_lines: 0,
+            name_width: 0,
+            value_column: ValueColumn::default(),
         });
         match b.mux {
             Some((mux_sig, val)) => {
@@ -607,6 +850,9 @@ fn parse_sym(text: &str) -> anyhow::Result<SymbolDb> {
             }
             None => def.signals.extend(b.signals),
         }
+    }
+    for def in db.messages.values_mut() {
+        def.finalize();
     }
     Ok(db)
 }
@@ -717,13 +963,145 @@ mod demo_file_tests {
 
     #[test]
     fn demo_dbc_loads() {
-        let db = SymbolDb::load(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/demo.dbc"))).unwrap();
+        let db = SymbolDb::load(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/demo.dbc"
+        )))
+        .unwrap();
         assert_eq!(db.messages.len(), 7);
-        let eec1 = db.get(MsgKey { id: 0x0CF00400, ext: true }).unwrap();
+        let eec1 = db
+            .get(MsgKey {
+                id: 0x0CF00400,
+                ext: true,
+            })
+            .unwrap();
         assert_eq!(eec1.name, "EEC1");
-        let mux = db.get(MsgKey { id: 0x201, ext: false }).unwrap();
+        let mux = db
+            .get(MsgKey {
+                id: 0x201,
+                ext: false,
+            })
+            .unwrap();
         let d = mux.decode(&[2, 7, 0xAA, 0x55]);
-        assert_eq!(d.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["Page", "CounterC", "Magic"]);
-        assert!(db.get(MsgKey { id: 0x100, ext: false }).unwrap().comment.is_some());
+        assert_eq!(
+            d.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["Page", "CounterC", "Magic"]
+        );
+        assert!(
+            db.get(MsgKey {
+                id: 0x100,
+                ext: false
+            })
+            .unwrap()
+            .comment
+            .is_some()
+        );
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    fn demo() -> SymbolDb {
+        SymbolDb::load(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/demo.dbc"
+        )))
+        .unwrap()
+    }
+
+    fn sig<'a>(db: &'a SymbolDb, id: u32, name: &str) -> &'a SignalDef {
+        db.get(MsgKey { id, ext: false })
+            .unwrap()
+            .signals
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap()
+    }
+
+    #[test]
+    fn width_and_decimals_come_from_definition() {
+        let db = demo();
+        // RPM: 16-bit unsigned, factor 0.25 -> 0..16383.75
+        let rpm = sig(&db, 0x100, "RPM").fmt;
+        assert_eq!((rpm.width, rpm.decimals), (8, 2));
+        assert_eq!(rpm.number(100.0), "  100.00");
+        assert_eq!(rpm.number(1000.0), " 1000.00");
+        assert_eq!(rpm.number(16383.75), "16383.75");
+        // CoolantTemp: 8-bit, offset -40 -> -40..215 (needs a sign column)
+        let temp = sig(&db, 0x100, "CoolantTemp").fmt;
+        assert_eq!((temp.width, temp.decimals), (4, 0));
+        assert_eq!(temp.number(-40.0), " -40");
+        assert_eq!(temp.number(9.0), "   9");
+        // Gear: value table -> number plus text padded to the longest entry
+        let gear = sig(&db, 0x200, "Gear").fmt;
+        assert_eq!(gear.value(3.0, Some("D1")), "  3 D1");
+        assert_eq!(gear.value(0.0, Some("P")), "  0 P ");
+        // Speed factor 0.01 -> 2 decimals
+        assert_eq!(sig(&db, 0x200, "Speed").fmt.decimals, 2);
+    }
+
+    #[test]
+    fn column_aligns_decimal_points_and_text() {
+        let db = demo();
+        let rpm = sig(&db, 0x100, "RPM").fmt; // 5 int digits, 2 decimals
+        let temp = sig(&db, 0x100, "CoolantTemp").fmt; // sign + 3 digits, 0 decimals
+        let gear = sig(&db, 0x200, "Gear").fmt; // 3 digits + value table
+        let col = ValueColumn::fit([rpm, temp, gear]);
+        let lines = [
+            col.render(&rpm, 1000.0, None),
+            col.render(&temp, -40.0, None),
+            col.render(&gear, 3.0, Some("D1")),
+        ];
+        assert_eq!(lines[0], " 1000.00   ");
+        assert_eq!(lines[1], "  -40      ");
+        assert_eq!(lines[2], "    3    D1");
+        // same total length -> anything after (units) lines up
+        assert!(lines.iter().all(|l| l.len() == lines[2].len()), "{lines:?}");
+    }
+
+    #[test]
+    fn decimals_for_factors() {
+        assert_eq!(decimals_for(1.0), 0);
+        assert_eq!(decimals_for(0.1), 1);
+        assert_eq!(decimals_for(0.25), 2);
+        assert_eq!(decimals_for(0.125), 3);
+        assert_eq!(decimals_for(0.00390625), 4); // capped
+    }
+
+    #[test]
+    fn decoded_lines_are_stable() {
+        let db = demo();
+        let engine = db
+            .get(MsgKey {
+                id: 0x100,
+                ext: false,
+            })
+            .unwrap();
+        let a = engine.decode_lines(&[0x90, 0x01, 0x30, 0, 0, 0, 0, 0x01]); // 100 rpm
+        let b = engine.decode_lines(&[0xA0, 0x0F, 0xFF, 0, 0, 0, 0, 0x0F]); // 1000 rpm
+        assert_eq!(a.len(), 3);
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(x.len(), y.len(), "{x:?} vs {y:?}");
+        }
+        // name padded to the longest name ("RollingCounter"), then the 8-wide value
+        assert_eq!(a[0], format!("{:<14}  {} rpm", "RPM", "  100.00"));
+        // Units start in the same column on every line.
+        let unit_col = |l: &str, u: &str| l.rfind(u).unwrap();
+        assert_eq!(unit_col(&a[0], "rpm"), unit_col(&a[1], "degC"));
+
+        // Multiplexed message: same number of lines whatever the mux value.
+        let mux = db
+            .get(MsgKey {
+                id: 0x201,
+                ext: false,
+            })
+            .unwrap();
+        assert_eq!(mux.max_lines, 3);
+        for page in 0..6u8 {
+            let lines = mux.decode_lines(&[page, 7, 0xAA, 0x55]);
+            assert_eq!(lines.len(), 3, "page {page}");
+        }
     }
 }

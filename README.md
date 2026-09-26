@@ -6,6 +6,7 @@ A CAN bus viewer for Windows, macOS and Linux, built with Rust and egui.
 - **Stream**: a live, filterable list of frames. Times can be shown as relative, absolute or delta.
 - **Recording**: saves every frame to a `candump -L` log file. The file can be replayed here or with can-utils `canplayer`.
 - **Symbols**: loads Vector **DBC** or PEAK **SYM** files to name messages and decode signals, including multiplexed signals and value tables.
+- **Decoded values**: with a symbol file loaded, the Summary table shows each signal on its own line, and the Stream table gets a one-line *Decoded* column. Values have a fixed width and decimal count worked out from the signal definition (bit size, sign, factor, offset), so digits stay in place as values change. The **Signals** tab lists every signal with its value, unit, min/max, raw bits, update count and a history plot. Signal values are decoded in the bus thread, so min/max and history include every frame.
 - **Transmit**: sends one-off frames, sends periodic frames, and plays back candump logs with their original timing (with speed control and looping).
 - **Bus status**: shows controller state (active / warning / passive / bus-off), TEC/REC, bus load %, frame rate, error events and overruns, and a 5-minute history.
 
@@ -52,6 +53,19 @@ Controller state, error counters, bus load and frame-rate history, and the event
 | Log file | ✅ | ✅ | ✅ | Replays a candump log into the viewer for offline review, at 0.25x–100x or max speed. |
 
 Vendor libraries are loaded when you connect, not at build time. The app builds and runs without any vendor SDK installed.
+
+## Download
+
+Prebuilt binaries for Windows (x86_64), Linux (x86_64) and macOS (universal: Intel + Apple Silicon) are attached to each [GitHub release](https://github.com/HonakerM/CAN-Explorer/releases).
+
+- **macOS:** the binary isn't signed. After extracting, run `xattr -d com.apple.quarantine can_explorer` once, or right-click → Open.
+- **Linux:** run `chmod +x can_explorer` if needed.
+
+To publish a release, push a version tag. [`.github/workflows/release.yml`](.github/workflows/release.yml) builds and tests on all three platforms, then creates the release with the archives and `SHA256SUMS.txt`. Tags that contain a `-` (e.g. `v0.2.0-rc1`) are marked as pre-releases.
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
 
 ## Build & run
 

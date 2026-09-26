@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 use egui::{Color32, RichText, Sense};
 use egui_extras::{Column, TableBuilder};
 
-use crate::bus::{self, BusHandle, Cmd, IdStats, Shared};
+use crate::bus::{self, BusHandle, Cmd, IdStats, Shared, SignalStats};
 use crate::candump;
 use crate::device::{self, BackendKind, ConnectConfig, CtrlState, PcanBus};
 use crate::msg::{self, CanMsg, Dir, MsgKey, now_ts};
-use crate::symbols::SymbolDb;
+use crate::symbols::{self, SymbolDb};
 
 const BITRATES: &[u32] = &[
     10_000, 20_000, 50_000, 100_000, 125_000, 250_000, 500_000, 800_000, 1_000_000,
@@ -27,6 +27,7 @@ const ROW_H: f32 = 18.0;
 enum Tab {
     Stream,
     Summary,
+    Signals,
     Transmit,
     Status,
 }
@@ -45,6 +46,19 @@ enum SortBy {
     Count,
     Rate,
     Recent,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PlotWindow {
+    Secs(f64),
+    All,
+}
+
+/// A decoded signal row for the Signals tab (history is fetched separately
+/// for the selected signal only).
+struct SigRow {
+    stats: SignalStats,
+    order: usize,
 }
 
 struct PeriodicUi {
@@ -90,9 +104,10 @@ impl Filter {
 
     fn tok_matches(tok: &str, key: MsgKey, name: Option<&str>) -> bool {
         if let Ok(id) = msg::parse_hex_id(tok)
-            && id == key.id {
-                return true;
-            }
+            && id == key.id
+        {
+            return true;
+        }
         name.is_some_and(|n| n.to_lowercase().contains(tok))
     }
 
@@ -101,6 +116,14 @@ impl Filter {
             return false;
         }
         self.include.is_empty() || self.include.iter().any(|t| Self::tok_matches(t, key, name))
+    }
+    /// Like [`Filter::matches`] but a token may match any of several names.
+    fn matches_any(&self, key: MsgKey, names: &[&str]) -> bool {
+        let hit = |t: &String| names.iter().any(|n| Self::tok_matches(t, key, Some(n)));
+        if self.exclude.iter().any(hit) {
+            return false;
+        }
+        self.include.is_empty() || self.include.iter().any(hit)
     }
 }
 
@@ -122,7 +145,7 @@ pub struct App {
     #[cfg(target_os = "linux")]
     socketcan_ifaces: Vec<String>,
 
-    symbols: Option<SymbolDb>,
+    symbols: Option<Arc<SymbolDb>>,
     sym_gen: u64,
 
     tab: Tab,
@@ -146,6 +169,12 @@ pub struct App {
     summary_filter_text: String,
     selected: Option<MsgKey>,
 
+    // signals
+    sig_rows: Vec<SigRow>,
+    sig_filter_text: String,
+    sig_selected: Option<(MsgKey, String)>,
+    sig_plot_window: PlotWindow,
+
     // transmit
     tx_id: String,
     tx_ext: bool,
@@ -166,7 +195,8 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Table rows are clickable; selectable labels would swallow the clicks.
-        cc.egui_ctx.style_mut(|s| s.interaction.selectable_labels = false);
+        cc.egui_ctx
+            .style_mut(|s| s.interaction.selectable_labels = false);
         Self {
             shared: Arc::new(Shared::default()),
             bus: None,
@@ -194,6 +224,10 @@ impl App {
             sort_by: SortBy::Id,
             summary_filter_text: String::new(),
             selected: None,
+            sig_rows: Vec::new(),
+            sig_filter_text: String::new(),
+            sig_selected: None,
+            sig_plot_window: PlotWindow::Secs(30.0),
             tx_id: "123".into(),
             tx_ext: false,
             tx_fd: false,
@@ -250,29 +284,30 @@ impl App {
     fn poll_bus(&mut self) {
         let Some(b) = &self.bus else { return };
         if self.connecting
-            && let Ok(res) = b.connect_result.try_recv() {
-                self.connecting = false;
-                match res {
-                    Ok(name) => {
-                        self.info(format!("Connected: {name}"));
-                        self.connected_name = Some(name);
-                        // Re-arm periodic messages configured while offline.
-                        for p in &self.periodic {
-                            self.send_cmd(Cmd::SetPeriodic {
-                                id: p.id,
-                                msg: p.msg,
-                                period: Duration::from_secs_f64(p.period_ms / 1000.0),
-                                enabled: p.enabled,
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        self.bus = None;
-                        self.error(format!("Connect failed: {e}"));
-                        return;
+            && let Ok(res) = b.connect_result.try_recv()
+        {
+            self.connecting = false;
+            match res {
+                Ok(name) => {
+                    self.info(format!("Connected: {name}"));
+                    self.connected_name = Some(name);
+                    // Re-arm periodic messages configured while offline.
+                    for p in &self.periodic {
+                        self.send_cmd(Cmd::SetPeriodic {
+                            id: p.id,
+                            msg: p.msg,
+                            period: Duration::from_secs_f64(p.period_ms / 1000.0),
+                            enabled: p.enabled,
+                        });
                     }
                 }
+                Err(e) => {
+                    self.bus = None;
+                    self.error(format!("Connect failed: {e}"));
+                    return;
+                }
             }
+        }
         // Drain the live stream channel.
         let Some(b) = &self.bus else { return };
         while let Ok(m) = b.stream.try_recv() {
@@ -303,6 +338,7 @@ impl App {
             s.total = 0;
             s.generation += 1;
         }
+        self.shared.signals.lock().clear();
         self.shared.stream_dropped.store(0, Ordering::Relaxed);
         let mut st = self.shared.stats.lock();
         st.rx_total = 0;
@@ -313,6 +349,16 @@ impl App {
         st.peak_load_pct = 0.0;
         st.history.clear();
         st.events.clear();
+    }
+
+    /// Installs a symbol database for both the UI and the bus thread's
+    /// signal decoder, discarding signal statistics from the previous one.
+    fn set_symbols(&mut self, db: Option<Arc<SymbolDb>>) {
+        *self.shared.symbols.write() = db.clone();
+        self.shared.signals.lock().clear();
+        self.symbols = db;
+        self.sym_gen += 1;
+        self.sig_selected = None;
     }
 
     fn load_symbols(&mut self) {
@@ -326,8 +372,7 @@ impl App {
         match SymbolDb::load(&path) {
             Ok(db) => {
                 let n = db.messages.len();
-                self.symbols = Some(db);
-                self.sym_gen += 1;
+                self.set_symbols(Some(Arc::new(db)));
                 self.info(format!(
                     "Loaded {n} message definitions from {}",
                     path.display()
@@ -423,8 +468,7 @@ impl App {
                     .on_hover_text("Unload symbols")
                     .clicked()
             {
-                self.symbols = None;
-                self.sym_gen += 1;
+                self.set_symbols(None);
             }
             ui.separator();
             if ui
@@ -553,9 +597,9 @@ impl App {
                         .add_filter("candump log", &["log", "txt", "candump"])
                         .add_filter("All files", &["*"])
                         .pick_file()
-                    {
-                        self.cfg.log_path = Some(p);
-                    }
+                {
+                    self.cfg.log_path = Some(p);
+                }
                 ui.label("Speed");
                 egui::ComboBox::from_id_salt("logspeed")
                     .selected_text(speed_label(self.cfg.log_speed))
@@ -742,7 +786,8 @@ impl App {
         let stream = &self.stream;
         let front = self.stream_front_seq;
         let seqs = &self.filter_cache.seqs;
-        let symbols = self.symbols.as_ref();
+        let symbols = self.symbols.as_deref();
+        let has_sym = symbols.is_some();
         let t_ref = self.t_ref.unwrap_or(0.0);
         let time_mode = self.time_mode;
         let get = |row: usize| -> Option<&CanMsg> {
@@ -754,7 +799,7 @@ impl App {
             }
         };
 
-        TableBuilder::new(ui)
+        let mut table = TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
             .stick_to_bottom(self.autoscroll)
@@ -762,11 +807,21 @@ impl App {
             .column(Column::initial(120.0).at_least(60.0))
             .column(Column::initial(30.0))
             .column(Column::initial(80.0))
-            .column(Column::initial(180.0).at_least(60.0).clip(true))
-            .column(Column::initial(30.0))
-            .column(Column::remainder().at_least(150.0))
+            .column(Column::initial(150.0).at_least(60.0).clip(true))
+            .column(Column::initial(30.0));
+        table = if has_sym {
+            table
+                .column(Column::initial(200.0).at_least(80.0).clip(true))
+                .column(Column::remainder().at_least(150.0).clip(true))
+        } else {
+            table.column(Column::remainder().at_least(150.0))
+        };
+        table
             .header(20.0, |mut h| {
-                for t in ["Time", "Dir", "ID", "Name", "Len", "Data"] {
+                for t in ["Time", "Dir", "ID", "Name", "Len", "Data", "Decoded"]
+                    .into_iter()
+                    .take(if has_sym { 7 } else { 6 })
+                {
                     h.col(|ui| {
                         ui.strong(t);
                     });
@@ -806,13 +861,22 @@ impl App {
                         ui.monospace(m.len.to_string());
                     });
                     row.col(|ui| {
-                        let r = ui.monospace(m.data_hex());
-                        if let Some(def) = symbols.and_then(|s| s.get(m.key())) {
-                            r.on_hover_ui(|ui| {
-                                signals_grid(ui, &def.decode(m.data()), "stream_hover")
-                            });
-                        }
+                        ui.monospace(m.data_hex());
                     });
+                    if has_sym {
+                        row.col(|ui| {
+                            if let Some(def) = symbols.and_then(|s| s.get(m.key())) {
+                                let sigs = def.decode(m.data());
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(symbols::format_compact(&sigs)).monospace(),
+                                    )
+                                    .extend(),
+                                )
+                                .on_hover_ui(|ui| signals_grid(ui, &sigs, "stream_hover"));
+                            }
+                        });
+                    }
                 });
             });
     }
@@ -892,7 +956,8 @@ impl App {
         }
 
         let filter = Filter::parse(&self.summary_filter_text);
-        let symbols = self.symbols.as_ref();
+        let symbols = self.symbols.as_deref();
+        let has_sym = symbols.is_some();
         let rows: Vec<&IdStats> = self
             .summary_rows
             .iter()
@@ -900,25 +965,45 @@ impl App {
                 filter.is_empty() || filter.matches(r.key, symbols.and_then(|s| s.name(&r.last)))
             })
             .collect();
+        // Rows for messages with a symbol definition are tall enough for one
+        // line per signal. The height depends only on the definition, so it
+        // never changes while data (or a multiplexor value) changes.
+        let line_h = ui.text_style_height(&egui::TextStyle::Monospace);
+        let heights: Vec<f32> = rows
+            .iter()
+            .map(|r| {
+                let lines = symbols
+                    .and_then(|s| s.get(r.key))
+                    .map_or(1, |d| d.max_lines.max(1));
+                (lines as f32 * line_h + 4.0).max(ROW_H)
+            })
+            .collect();
         let hl = ui.visuals().warn_fg_color;
         let normal = ui.visuals().text_color();
         let mut clicked: Option<MsgKey> = None;
         let selected = self.selected;
 
-        TableBuilder::new(ui)
+        let mut table = TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
             .sense(Sense::click())
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Min))
             .column(Column::initial(80.0))
-            .column(Column::initial(170.0).clip(true))
+            .column(Column::initial(130.0).clip(true))
             .column(Column::initial(30.0))
             .column(Column::initial(200.0).at_least(80.0))
-            .column(Column::initial(80.0))
             .column(Column::initial(70.0))
-            .column(Column::initial(150.0))
             .column(Column::initial(60.0))
-            .column(Column::remainder().at_least(40.0))
+            .column(Column::initial(150.0))
+            .column(Column::initial(50.0));
+        table = if has_sym {
+            table
+                .column(Column::initial(45.0))
+                .column(Column::remainder().at_least(150.0).clip(true))
+        } else {
+            table.column(Column::remainder().at_least(40.0))
+        };
+        table
             .header(20.0, |mut h| {
                 for (t, tip) in [
                     ("ID", ""),
@@ -930,7 +1015,11 @@ impl App {
                     ("Period ms (avg/min/max)", ""),
                     ("Age s", "Seconds since last frame"),
                     ("Dir", ""),
-                ] {
+                    ("Decoded", "Signal values from the loaded symbol file"),
+                ]
+                .into_iter()
+                .take(if has_sym { 10 } else { 9 })
+                {
                     h.col(|ui| {
                         let r = ui.strong(t);
                         if !tip.is_empty() {
@@ -940,7 +1029,7 @@ impl App {
                 }
             })
             .body(|body| {
-                body.rows(ROW_H, rows.len(), |mut row| {
+                body.heterogeneous_rows(heights.into_iter(), |mut row| {
                     let r = rows[row.index()];
                     row.set_selected(selected == Some(r.key));
                     let m = &r.last;
@@ -1005,6 +1094,25 @@ impl App {
                         };
                         ui.label(s);
                     });
+                    if has_sym {
+                        row.col(|ui| {
+                            if let Some(def) = symbols.and_then(|s| s.get(r.key)) {
+                                let lines = def.decode_lines(m.data());
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    for l in &lines {
+                                        ui.add(
+                                            egui::Label::new(RichText::new(l).monospace()).extend(),
+                                        );
+                                    }
+                                })
+                                .response
+                                .on_hover_ui(|ui| {
+                                    signals_grid(ui, &def.decode(m.data()), "summary_hover")
+                                });
+                            }
+                        });
+                    }
                     if row.response().clicked() {
                         clicked = Some(r.key);
                     }
@@ -1467,6 +1575,451 @@ impl App {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Signals tab
+// ---------------------------------------------------------------------------
+
+impl App {
+    fn refresh_signals(&mut self) {
+        let db = self.symbols.clone();
+        let table = self.shared.signals.lock();
+        self.sig_rows.clear();
+        for s in table.entries.values() {
+            // Keep the symbol file's signal order within a message
+            // (multiplexor first).
+            let order = db
+                .as_ref()
+                .and_then(|db| db.get(s.msg_key))
+                .map(|def| {
+                    if def.mux.as_ref().is_some_and(|m| m.name == s.name) {
+                        0
+                    } else {
+                        def.signals
+                            .iter()
+                            .position(|d| d.name == s.name)
+                            .map_or(usize::MAX, |i| i + 1)
+                    }
+                })
+                .unwrap_or(usize::MAX);
+            self.sig_rows.push(SigRow {
+                stats: s.without_history(),
+                order,
+            });
+        }
+        drop(table);
+        self.sig_rows.sort_by(|a, b| {
+            (a.stats.msg_key.ext, a.stats.msg_key.id, a.order).cmp(&(
+                b.stats.msg_key.ext,
+                b.stats.msg_key.id,
+                b.order,
+            ))
+        });
+    }
+
+    fn signals_tab(&mut self, ui: &mut egui::Ui) {
+        if self.symbols.is_none() {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("No symbol file loaded").size(18.0));
+                ui.label(
+                    RichText::new(
+                        "Load a DBC or PCAN .sym file to turn raw frames into signal values.",
+                    )
+                    .weak(),
+                );
+                ui.add_space(8.0);
+                if ui.button("📂 Load symbols…").clicked() {
+                    self.load_symbols();
+                }
+            });
+            return;
+        }
+        self.refresh_signals();
+        let now = now_ts();
+        let n_msgs = {
+            let mut keys: Vec<MsgKey> = self.sig_rows.iter().map(|r| r.stats.msg_key).collect();
+            keys.dedup();
+            keys.len()
+        };
+
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "{} signals from {} messages",
+                self.sig_rows.len(),
+                n_msgs
+            ));
+            ui.separator();
+            ui.label("Filter");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sig_filter_text)
+                    .desired_width(220.0)
+                    .hint_text("message / signal names or IDs"),
+            );
+            ui.separator();
+            if ui
+                .button("Reset min/max")
+                .on_hover_text("Clear min/max, update counts and history for all signals")
+                .clicked()
+            {
+                self.shared.signals.lock().clear();
+            }
+        });
+        ui.separator();
+
+        // Plot of the selected signal
+        if let Some(sel) = self.sig_selected.clone() {
+            let snapshot = self.shared.signals.lock().entries.get(&sel).map(|e| {
+                (
+                    e.history.clone(),
+                    e.msg_name.clone(),
+                    e.name.clone(),
+                    e.unit.clone(),
+                    e.display_value(),
+                    e.fmt,
+                )
+            });
+            match snapshot {
+                None => self.sig_selected = None,
+                Some((hist, msg_name, name, unit, value, fmt)) => {
+                    egui::TopBottomPanel::bottom("signal_plot")
+                        .resizable(true)
+                        .default_height(260.0)
+                        .min_height(120.0)
+                        .show_inside(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.strong(format!("{msg_name}.{name}"));
+                                ui.monospace(format!("{value} {unit}"));
+                                ui.separator();
+                                for (w, label) in [
+                                    (PlotWindow::Secs(10.0), "10 s"),
+                                    (PlotWindow::Secs(30.0), "30 s"),
+                                    (PlotWindow::Secs(60.0), "1 min"),
+                                    (PlotWindow::Secs(300.0), "5 min"),
+                                    (PlotWindow::All, "All"),
+                                ] {
+                                    ui.selectable_value(&mut self.sig_plot_window, w, label);
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("✖").clicked() {
+                                            self.sig_selected = None;
+                                        }
+                                    },
+                                );
+                            });
+                            signal_plot(ui, &hist, self.sig_plot_window, &unit, fmt);
+                        });
+                }
+            }
+        }
+
+        let filter = Filter::parse(&self.sig_filter_text);
+        let rows: Vec<&SigRow> = self
+            .sig_rows
+            .iter()
+            .filter(|r| {
+                filter.is_empty()
+                    || filter.matches_any(r.stats.msg_key, &[&r.stats.msg_name, &r.stats.name])
+            })
+            .collect();
+        let selected = self.sig_selected.clone();
+        let mut clicked = None;
+        let strong = ui.visuals().strong_text_color();
+        // One shared layout for the whole table so decimal points (and the
+        // value-table text) line up across rows.
+        let col = symbols::ValueColumn::fit(rows.iter().map(|r| r.stats.fmt));
+        let num_col = col.numbers_only();
+        let raw_w = rows
+            .iter()
+            .map(|r| format!("{:X}", r.stats.raw).len())
+            .max()
+            .unwrap_or(1);
+
+        TableBuilder::new(ui)
+            .striped(true)
+            .resizable(true)
+            .sense(Sense::click())
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::initial(80.0))
+            .column(Column::initial(140.0).clip(true))
+            .column(Column::initial(160.0).clip(true))
+            .column(Column::initial(130.0).clip(true))
+            .column(Column::initial(60.0).clip(true))
+            .column(Column::initial(90.0))
+            .column(Column::initial(90.0))
+            .column(Column::initial(90.0))
+            .column(Column::initial(80.0))
+            .column(Column::remainder().at_least(40.0))
+            .header(20.0, |mut h| {
+                for (t, tip) in [
+                    ("ID", ""),
+                    ("Message", ""),
+                    ("Signal", ""),
+                    ("Value", "Physical value = raw × factor + offset"),
+                    ("Unit", ""),
+                    ("Min", "Smallest value seen since load / reset"),
+                    ("Max", "Largest value seen since load / reset"),
+                    ("Raw", "Raw integer bits before scaling"),
+                    ("Updates", "Number of frames that carried this signal"),
+                    ("Age s", "Seconds since the last update"),
+                ] {
+                    h.col(|ui| {
+                        let r = ui.strong(t);
+                        if !tip.is_empty() {
+                            r.on_hover_text(tip);
+                        }
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(ROW_H, rows.len(), |mut row| {
+                    let r = &rows[row.index()].stats;
+                    let key = (r.msg_key, r.name.clone());
+                    row.set_selected(selected.as_ref() == Some(&key));
+                    row.col(|ui| {
+                        ui.monospace(r.msg_key.fmt_id());
+                    });
+                    row.col(|ui| {
+                        ui.label(&r.msg_name);
+                    });
+                    row.col(|ui| {
+                        ui.label(&r.name);
+                    });
+                    row.col(|ui| {
+                        ui.label(
+                            RichText::new(col.render(&r.fmt, r.value, r.text.as_deref()))
+                                .monospace()
+                                .color(strong),
+                        );
+                    });
+                    row.col(|ui| {
+                        ui.label(&r.unit);
+                    });
+                    row.col(|ui| {
+                        ui.monospace(num_col.render(&r.fmt, r.min, None));
+                    });
+                    row.col(|ui| {
+                        ui.monospace(num_col.render(&r.fmt, r.max, None));
+                    });
+                    row.col(|ui| {
+                        ui.monospace(format!("{:>w$}", format!("0x{:X}", r.raw), w = raw_w + 2));
+                    });
+                    row.col(|ui| {
+                        ui.monospace(r.count.to_string());
+                    });
+                    row.col(|ui| {
+                        ui.monospace(format!("{:.1}", (now - r.last_wall).max(0.0)));
+                    });
+                    if row.response().clicked() {
+                        clicked = Some(key);
+                    }
+                });
+            });
+
+        if let Some(k) = clicked {
+            self.sig_selected = if self.sig_selected.as_ref() == Some(&k) {
+                None
+            } else {
+                Some(k)
+            };
+        }
+    }
+}
+
+/// Line plot of a signal's history, decimated to roughly two points per pixel.
+fn signal_plot(
+    ui: &mut egui::Ui,
+    hist: &VecDeque<(f64, f64)>,
+    window: PlotWindow,
+    unit: &str,
+    fmt: symbols::ValueFormat,
+) {
+    let size = egui::vec2(ui.available_width(), ui.available_height().max(80.0));
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    let painter = ui.painter_at(rect);
+    let visuals = ui.visuals();
+    painter.rect_filled(rect, 3.0, visuals.extreme_bg_color);
+    let weak = visuals.weak_text_color();
+    let font = egui::FontId::monospace(11.0);
+
+    let Some(&(t_last, _)) = hist.back() else {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "No data yet",
+            font,
+            weak,
+        );
+        return;
+    };
+    let t_first = hist.front().map_or(t_last, |p| p.0);
+    let t_start = match window {
+        PlotWindow::Secs(s) => t_last - s,
+        PlotWindow::All => t_first,
+    };
+    let span = (t_last - t_start).max(1e-6);
+    let first = hist.partition_point(|p| p.0 < t_start);
+    let pts = hist.range(first..);
+
+    let (mut ymin, mut ymax) = (f64::MAX, f64::MIN);
+    for &(_, v) in pts.clone() {
+        ymin = ymin.min(v);
+        ymax = ymax.max(v);
+    }
+    if ymin > ymax {
+        return;
+    }
+    if (ymax - ymin).abs() < 1e-12 {
+        let pad = if ymin.abs() > 1e-9 {
+            ymin.abs() * 0.1
+        } else {
+            1.0
+        };
+        ymin -= pad;
+        ymax += pad;
+    } else {
+        let pad = (ymax - ymin) * 0.05;
+        ymin -= pad;
+        ymax += pad;
+    }
+
+    let plot = egui::Rect::from_min_max(
+        rect.min + egui::vec2(70.0, 8.0),
+        rect.max - egui::vec2(10.0, 20.0),
+    );
+    let to_screen = |t: f64, v: f64| {
+        egui::pos2(
+            plot.left() + ((t - t_start) / span) as f32 * plot.width(),
+            plot.bottom() - ((v - ymin) / (ymax - ymin)) as f32 * plot.height(),
+        )
+    };
+
+    // Grid + Y labels
+    let grid = egui::Stroke::new(1.0, visuals.faint_bg_color.gamma_multiply(2.0));
+    for i in 0..=4 {
+        let v = ymin + (ymax - ymin) * i as f64 / 4.0;
+        let y = to_screen(t_start, v).y;
+        painter.line_segment(
+            [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
+            grid,
+        );
+        painter.text(
+            egui::pos2(plot.left() - 6.0, y),
+            egui::Align2::RIGHT_CENTER,
+            fmt_axis(v),
+            font.clone(),
+            weak,
+        );
+    }
+    // X labels (seconds before the newest sample)
+    for i in 0..=4 {
+        let t = t_start + span * i as f64 / 4.0;
+        let x = to_screen(t, ymin).x;
+        painter.text(
+            egui::pos2(x, plot.bottom() + 4.0),
+            egui::Align2::CENTER_TOP,
+            format!("{:.1}s", t - t_last),
+            font.clone(),
+            weak,
+        );
+    }
+    if !unit.is_empty() {
+        painter.text(
+            rect.min + egui::vec2(6.0, 4.0),
+            egui::Align2::LEFT_TOP,
+            unit,
+            font.clone(),
+            weak,
+        );
+    }
+
+    // Decimate: min & max per pixel column keeps spikes visible.
+    let width_px = plot.width().max(1.0) as usize;
+    let n = hist.len() - first;
+    let mut line: Vec<egui::Pos2> = Vec::with_capacity(n.min(width_px * 2 + 2));
+    if n <= width_px * 2 {
+        line.extend(pts.clone().map(|&(t, v)| to_screen(t, v)));
+    } else {
+        let mut bucket = usize::MAX;
+        let (mut lo, mut hi, mut t_lo, mut t_hi) = (0.0, 0.0, 0.0, 0.0);
+        let flush = |line: &mut Vec<egui::Pos2>, t_lo: f64, lo: f64, t_hi: f64, hi: f64| {
+            if t_lo <= t_hi {
+                line.push(to_screen(t_lo, lo));
+                line.push(to_screen(t_hi, hi));
+            } else {
+                line.push(to_screen(t_hi, hi));
+                line.push(to_screen(t_lo, lo));
+            }
+        };
+        for &(t, v) in pts.clone() {
+            let b = (((t - t_start) / span) * width_px as f64) as usize;
+            if b != bucket {
+                if bucket != usize::MAX {
+                    flush(&mut line, t_lo, lo, t_hi, hi);
+                }
+                bucket = b;
+                (lo, hi, t_lo, t_hi) = (v, v, t, t);
+            } else {
+                if v < lo {
+                    lo = v;
+                    t_lo = t;
+                }
+                if v > hi {
+                    hi = v;
+                    t_hi = t;
+                }
+            }
+        }
+        if bucket != usize::MAX {
+            flush(&mut line, t_lo, lo, t_hi, hi);
+        }
+    }
+    let color = Color32::from_rgb(80, 150, 230);
+    if line.len() == 1 {
+        painter.circle_filled(line[0], 2.5, color);
+    } else {
+        painter.add(egui::Shape::line(line, egui::Stroke::new(1.5, color)));
+    }
+
+    // Hover readout
+    if let Some(pos) = resp.hover_pos()
+        && plot.contains(pos)
+    {
+        let t = t_start + ((pos.x - plot.left()) / plot.width()) as f64 * span;
+        let i = hist
+            .partition_point(|p| p.0 < t)
+            .clamp(first, hist.len() - 1);
+        let (ts, v) = hist[i];
+        let p = to_screen(ts, v);
+        painter.line_segment(
+            [egui::pos2(p.x, plot.top()), egui::pos2(p.x, plot.bottom())],
+            egui::Stroke::new(1.0, weak),
+        );
+        painter.circle_filled(p, 3.0, color);
+        painter.text(
+            p + egui::vec2(6.0, -6.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!("{} {unit}  @ {:.3}s", fmt.number(v).trim(), ts - t_last),
+            font,
+            visuals.strong_text_color(),
+        );
+    }
+}
+
+fn fmt_axis(v: f64) -> String {
+    let a = v.abs();
+    if a >= 1e5 || (a > 0.0 && a < 1e-3) {
+        format!("{v:.2e}")
+    } else if a >= 100.0 {
+        format!("{v:.0}")
+    } else if a >= 1.0 {
+        format!("{v:.2}")
+    } else {
+        format!("{v:.3}")
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_bus();
@@ -1484,6 +2037,7 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Summary, "📋 Summary");
                 ui.selectable_value(&mut self.tab, Tab::Stream, "📜 Stream");
+                ui.selectable_value(&mut self.tab, Tab::Signals, "📈 Signals");
                 ui.selectable_value(&mut self.tab, Tab::Transmit, "📤 Transmit");
                 ui.selectable_value(&mut self.tab, Tab::Status, "🩺 Bus status");
             });
@@ -1497,6 +2051,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Stream => self.stream_tab(ui),
             Tab::Summary => self.summary_tab(ui),
+            Tab::Signals => self.signals_tab(ui),
             Tab::Transmit => self.transmit_tab(ui),
             Tab::Status => self.status_tab(ui),
         });
@@ -1553,11 +2108,17 @@ fn signals_grid(ui: &mut egui::Ui, sigs: &[crate::symbols::DecodedSignal], id: &
             ui.strong("Unit");
             ui.strong("Raw");
             ui.end_row();
+            let col = crate::symbols::ValueColumn::fit(sigs.iter().map(|s| s.fmt));
+            let raw_w = sigs
+                .iter()
+                .map(|s| format!("{:X}", s.raw).len())
+                .max()
+                .unwrap_or(1);
             for s in sigs {
                 ui.label(&s.name);
-                ui.monospace(s.display_value());
+                ui.monospace(col.render(&s.fmt, s.value, s.text.as_deref()));
                 ui.label(&s.unit);
-                ui.monospace(format!("0x{:X}", s.raw));
+                ui.monospace(format!("{:>w$}", format!("0x{:X}", s.raw), w = raw_w + 2));
                 ui.end_row();
             }
         });

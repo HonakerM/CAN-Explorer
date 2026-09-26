@@ -48,15 +48,16 @@ pub fn parse_line(line: &str) -> Result<Option<CanMsg>, String> {
     let mut tokens = line.split_whitespace().peekable();
     let mut ts = None;
     if let Some(t) = tokens.peek()
-        && t.starts_with('(') {
-            let t = tokens.next().unwrap();
-            let inner = t.trim_start_matches('(').trim_end_matches(')');
-            ts = Some(
-                inner
-                    .parse::<f64>()
-                    .map_err(|e| format!("bad timestamp '{inner}': {e}"))?,
-            );
-        }
+        && t.starts_with('(')
+    {
+        let t = tokens.next().unwrap();
+        let inner = t.trim_start_matches('(').trim_end_matches(')');
+        ts = Some(
+            inner
+                .parse::<f64>()
+                .map_err(|e| format!("bad timestamp '{inner}': {e}"))?,
+        );
+    }
     let rest: Vec<&str> = tokens.collect();
     // Find the frame token (contains '#'); the interface name precedes it.
     let mut msg = if let Some(frame_tok) = rest.iter().find(|t| t.contains('#')) {

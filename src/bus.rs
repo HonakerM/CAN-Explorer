@@ -3,7 +3,9 @@
 //! Every received / transmitted frame is, *in this thread*:
 //!   1. applied to the per-ID [`Summary`] (never dropped),
 //!   2. written to the recording file if one is active (never dropped),
-//!   3. offered to the UI's live stream channel (may be dropped if the UI
+//!   3. decoded into per-signal values (min/max/history) when a symbol file
+//!      is loaded (never dropped),
+//!   4. offered to the UI's live stream channel (may be dropped if the UI
 //!      can't keep up — drops are counted and shown).
 
 use std::collections::{HashMap, VecDeque};
@@ -16,15 +18,18 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use crate::candump;
 use crate::device::{self, BusEvent, CanDevice, ConnectConfig, CtrlState, DevEvent};
 use crate::msg::{CanMsg, Dir, MsgKey, now_ts};
+use crate::symbols::{SymbolDb, ValueFormat};
 
 pub const STREAM_CHANNEL_CAP: usize = 200_000;
 const MAX_EVENTS: usize = 1000;
 pub const HISTORY_SECS: usize = 300;
+/// Samples of history kept per decoded signal.
+pub const SIGNAL_HISTORY: usize = 20_000;
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -169,9 +174,74 @@ impl BusStats {
     }
 }
 
+/// Latest decoded value and statistics for one signal of one message.
+#[derive(Clone)]
+pub struct SignalStats {
+    pub msg_key: MsgKey,
+    pub msg_name: String,
+    pub name: String,
+    pub unit: String,
+    pub value: f64,
+    pub raw: u64,
+    pub text: Option<String>,
+    /// Fixed-width display format from the symbol file.
+    pub fmt: ValueFormat,
+    pub min: f64,
+    pub max: f64,
+    pub count: u64,
+    /// Frame timestamp of the last update.
+    pub last_ts: f64,
+    /// Wall-clock time of the last update.
+    pub last_wall: f64,
+    /// (frame timestamp, physical value), oldest first.
+    pub history: VecDeque<(f64, f64)>,
+}
+
+impl SignalStats {
+    pub fn display_value(&self) -> String {
+        self.fmt.value(self.value, self.text.as_deref())
+    }
+
+    /// Cheap copy for UI tables (history can be tens of thousands of samples).
+    pub fn without_history(&self) -> SignalStats {
+        SignalStats {
+            msg_key: self.msg_key,
+            msg_name: self.msg_name.clone(),
+            name: self.name.clone(),
+            unit: self.unit.clone(),
+            value: self.value,
+            raw: self.raw,
+            text: self.text.clone(),
+            fmt: self.fmt,
+            min: self.min,
+            max: self.max,
+            count: self.count,
+            last_ts: self.last_ts,
+            last_wall: self.last_wall,
+            history: VecDeque::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct SignalTable {
+    pub entries: HashMap<(MsgKey, String), SignalStats>,
+    pub generation: u64,
+}
+
+impl SignalTable {
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.generation += 1;
+    }
+}
+
 #[derive(Default)]
 pub struct Shared {
     pub summary: Mutex<Summary>,
+    /// Symbol database used by the bus thread to decode signals.
+    pub symbols: RwLock<Option<Arc<SymbolDb>>>,
+    pub signals: Mutex<SignalTable>,
     pub stats: Mutex<BusStats>,
     /// Frames the live stream view did not receive because it fell behind.
     pub stream_dropped: AtomicU64,
@@ -452,6 +522,55 @@ impl Worker {
             summary.generation += 1;
         }
 
+        let db = self.shared.symbols.read().clone();
+        if let Some(db) = db
+            && !self.batch.is_empty()
+        {
+            let mut table = self.shared.signals.lock();
+            let mut touched = false;
+            for m in &self.batch {
+                let Some(def) = db.get(m.key()) else { continue };
+                let msg_name = def.name_for(m.data());
+                for d in def.decode(m.data()) {
+                    touched = true;
+                    let e = table
+                        .entries
+                        .entry((m.key(), d.name.clone()))
+                        .or_insert_with(|| SignalStats {
+                            msg_key: m.key(),
+                            msg_name: msg_name.to_string(),
+                            name: d.name.clone(),
+                            unit: d.unit.clone(),
+                            value: d.value,
+                            raw: d.raw,
+                            text: None,
+                            fmt: d.fmt,
+                            min: d.value,
+                            max: d.value,
+                            count: 0,
+                            last_ts: m.ts,
+                            last_wall: wall,
+                            history: VecDeque::new(),
+                        });
+                    e.value = d.value;
+                    e.raw = d.raw;
+                    e.text = d.text;
+                    e.min = e.min.min(d.value);
+                    e.max = e.max.max(d.value);
+                    e.count += 1;
+                    e.last_ts = m.ts;
+                    e.last_wall = wall;
+                    if e.history.len() >= SIGNAL_HISTORY {
+                        e.history.pop_front();
+                    }
+                    e.history.push_back((m.ts, d.value));
+                }
+            }
+            if touched {
+                table.generation += 1;
+            }
+        }
+
         let mut rx = 0u64;
         let mut tx = 0u64;
         for m in &self.batch {
@@ -725,11 +844,15 @@ mod tests {
     #[test]
     fn summary_and_recording_are_lossless() {
         let shared = Arc::new(Shared::default());
-        let cfg = ConnectConfig { channel: "stress".into(), ..Default::default() };
+        let cfg = ConnectConfig {
+            channel: "stress".into(),
+            ..Default::default()
+        };
         let h = spawn(cfg, shared.clone());
         assert!(h.connect_result.recv().unwrap().is_ok());
 
-        let log = std::env::temp_dir().join(format!("can_explorer_test_{}.log", std::process::id()));
+        let log =
+            std::env::temp_dir().join(format!("can_explorer_test_{}.log", std::process::id()));
         h.send(Cmd::StartRecording(log.clone()));
         h.send(Cmd::Send(CanMsg::new(0x555, false, &[1, 2, 3])));
 
@@ -743,18 +866,33 @@ mod tests {
         let summary = shared.summary.lock();
         let stats = shared.stats.lock();
         let per_id: u64 = summary.entries.values().map(|e| e.count).sum();
-        assert!(summary.total > 5000, "expected stress traffic, got {}", summary.total);
+        assert!(
+            summary.total > 5000,
+            "expected stress traffic, got {}",
+            summary.total
+        );
         assert_eq!(per_id, summary.total);
         assert_eq!(summary.total, stats.rx_total + stats.tx_total);
         assert_eq!(stats.tx_total, 1);
-        assert_eq!(summary.entries[&MsgKey { id: 0x555, ext: false }].tx_count, 1);
+        assert_eq!(
+            summary.entries[&MsgKey {
+                id: 0x555,
+                ext: false
+            }]
+                .tx_count,
+            1
+        );
         let dropped = shared.stream_dropped.load(Ordering::Relaxed);
         assert_eq!(streamed + dropped, summary.total);
 
         let text = std::fs::read_to_string(&log).unwrap();
         let recorded = text.lines().count() as u64;
         let _ = std::fs::remove_file(&log);
-        assert!(recorded > 5000 && recorded <= summary.total, "recorded {recorded} of {}", summary.total);
+        assert!(
+            recorded > 5000 && recorded <= summary.total,
+            "recorded {recorded} of {}",
+            summary.total
+        );
         for line in text.lines() {
             assert!(candump::parse_line(line).unwrap().is_some());
         }
@@ -766,5 +904,50 @@ mod tests {
         while rx.try_recv().is_ok() {
             *streamed += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use super::*;
+
+    /// Every frame of a message with a symbol definition updates its signals.
+    #[test]
+    fn signals_decoded_for_every_frame() {
+        let shared = Arc::new(Shared::default());
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/demo.dbc");
+        *shared.symbols.write() = Some(Arc::new(
+            SymbolDb::load(std::path::Path::new(path)).unwrap(),
+        ));
+
+        let h = spawn(ConnectConfig::default(), shared.clone());
+        assert!(h.connect_result.recv().unwrap().is_ok());
+        std::thread::sleep(Duration::from_millis(1000));
+        drop(h);
+
+        let summary = shared.summary.lock();
+        let signals = shared.signals.lock();
+        let engine = MsgKey {
+            id: 0x100,
+            ext: false,
+        };
+        let frames = summary.entries[&engine].count;
+        assert!(frames > 50);
+        for name in ["RPM", "CoolantTemp", "RollingCounter"] {
+            let s = &signals.entries[&(engine, name.to_string())];
+            assert_eq!(s.count, frames, "{name} updates");
+            assert_eq!(s.history.len() as u64, frames);
+            assert!(s.min <= s.value && s.value <= s.max);
+            assert_eq!(s.msg_name, "EngineData");
+        }
+        // RPM = raw * 0.25; the simulator sweeps 500..5500 rpm
+        let rpm = &signals.entries[&(engine, "RPM".to_string())];
+        assert!(
+            rpm.value >= 400.0 && rpm.value <= 5600.0,
+            "rpm {}",
+            rpm.value
+        );
+        // IDs without a definition (0x300) produce no signals
+        assert!(signals.entries.keys().all(|(k, _)| k.id != 0x300));
     }
 }

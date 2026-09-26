@@ -1,0 +1,131 @@
+name: Release
+
+# Push a tag like `v0.2.0` (or `v0.2.0-rc1` for a pre-release) to build
+# binaries for every platform and publish them as a GitHub Release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and release, e.g. v0.2.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            targets: x86_64-pc-windows-msvc
+          - name: linux-x86_64
+            # Oldest supported runner -> oldest glibc -> widest compatibility.
+            os: ubuntu-22.04
+            targets: x86_64-unknown-linux-gnu
+          - name: macos-universal
+            os: macos-latest
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release --locked --target x86_64-pc-windows-msvc
+          $dir = "can_explorer-$env:TAG-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force $dir, "$dir/examples" | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/can_explorer.exe $dir/
+          Copy-Item README.md $dir/
+          Copy-Item examples/demo.dbc "$dir/examples/"
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-gnu
+          dir="can_explorer-${TAG}-${{ matrix.name }}"
+          mkdir -p "$dir/examples"
+          cp target/x86_64-unknown-linux-gnu/release/can_explorer "$dir/"
+          cp README.md "$dir/"
+          cp examples/demo.dbc "$dir/examples/"
+          tar czf "$dir.tar.gz" "$dir"
+
+      - name: Build (macOS universal)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          dir="can_explorer-${TAG}-${{ matrix.name }}"
+          mkdir -p "$dir/examples"
+          lipo -create -output "$dir/can_explorer" \
+            target/aarch64-apple-darwin/release/can_explorer \
+            target/x86_64-apple-darwin/release/can_explorer
+          cp README.md "$dir/"
+          cp examples/demo.dbc "$dir/examples/"
+          tar czf "$dir.tar.gz" "$dir"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            can_explorer-*.zip
+            can_explorer-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: CAN Explorer ${{ env.TAG }}
+          generate_release_notes: true
+          prerelease: ${{ contains(env.TAG, '-') }}
+          files: dist/*
+          fail_on_unmatched_files: true
